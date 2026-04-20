@@ -1,46 +1,59 @@
-import torch
-import torch.nn as nn
-import numpy as np
-import pandas as pd
+"""
+Two-Stream Multi-modal Fusion Evaluation Script.
+
+This script evaluates a Late Fusion strategy using pre-trained RGB (3D-CNN) 
+and Skeleton (CNN-LSTM) models. It performs a grid search to determine the optimal 
+fusion weights and generates a confusion matrix for the local validation set.
+"""
+
 import os
 import cv2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, accuracy_score
 import torchvision.models.video as models
+from sklearn.metrics import confusion_matrix
 from torch.utils.data import Dataset, DataLoader
 
-# =========================================================================
-# ⚙️ 配置区域
-# =========================================================================
+# ==========================================
+# Configuration
+# ==========================================
 SKELETON_MODEL_PATH = "best_model_v3.pth"
 RGB_MODEL_PATH = "best_model_rgb.pth"
-
-# 注意：这里我们使用【训练集】的路径来进行验证
 TRAIN_VIDEO_DIR = "train_set"
 TRAIN_SKELETON_DIR = "skeleton_data/train"
 CSV_FILE = "annotations/train_set_labels.csv"
 
-# 融合权重
-ALPHA_RGB = 0.8
-ALPHA_SKELETON = 0.2
-
-BATCH_SIZE = 8  # 验证时不反向传播，可以稍微大点
+BATCH_SIZE = 8
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =========================================================================
-# 🏗️ 模型定义 & 数据处理 (复用之前的逻辑)
-# =========================================================================
-
-# --- 1. 骨架模型 ---
+# ==========================================
+# Model Definition
+# ==========================================
 class LightweightCNNLSTM(nn.Module):
+    """
+    Lightweight CNN-LSTM network for skeleton-based action recognition.
+
+    Args:
+        input_size (int): Dimension of the input skeleton features.
+        hidden_size (int): Number of features in the LSTM hidden state.
+        num_classes (int): Number of output action classes.
+    """
     def __init__(self, input_size, hidden_size, num_classes):
         super(LightweightCNNLSTM, self).__init__()
         self.cnn = nn.Sequential(
             nn.Conv1d(input_size, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64), nn.ReLU(), nn.Dropout(0.1))
-        self.lstm = nn.LSTM(64, hidden_size, num_layers=2, batch_first=True, bidirectional=True, dropout=0.3)
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size*2, num_heads=4, batch_first=True)
+            nn.BatchNorm1d(64), 
+            nn.ReLU(), 
+            nn.Dropout(0.1)
+        )
+        self.lstm = nn.LSTM(64, hidden_size, num_layers=2, batch_first=True, 
+                            bidirectional=True, dropout=0.3)
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_size*2, 
+                                               num_heads=4, batch_first=True)
         self.fc = nn.Linear(hidden_size * 2, num_classes)
 
     def forward(self, x):
@@ -52,8 +65,18 @@ class LightweightCNNLSTM(nn.Module):
         pooled = torch.mean(attn_out, dim=1)
         return self.fc(pooled)
 
-# --- 2. 双模态数据集类 ---
+# ==========================================
+# Dataset Processing
+# ==========================================
 class DualStreamDataset(Dataset):
+    """
+    Custom Dataset to load paired skeleton sequences and RGB video frames.
+
+    Args:
+        csv_path (str): Path to the annotation CSV file.
+        video_dir (str): Directory containing raw .avi videos.
+        skeleton_dir (str): Directory containing extracted .npy skeleton features.
+    """
     def __init__(self, csv_path, video_dir, skeleton_dir):
         self.labels_df = pd.read_csv(csv_path, header=None)
         self.video_dir = video_dir
@@ -65,30 +88,42 @@ class DualStreamDataset(Dataset):
         return len(self.labels_df)
 
     def load_skeleton(self, file_id):
-        # 骨架处理逻辑 (train_model_v3.py)
+        """
+        Loads and normalizes skeleton data, applying root centering and padding.
+        """
         path = os.path.join(self.skeleton_dir, file_id + ".npy")
-        if not os.path.exists(path): return torch.zeros((100, 99))
-        raw = np.load(path)
-        if raw.shape[0] == 0: return torch.zeros((100, 99))
+        if not os.path.exists(path): 
+            return torch.zeros((100, 99))
         
-        # Norm
+        raw = np.load(path)
+        if raw.shape[0] == 0: 
+            return torch.zeros((100, 99))
+        
         frames = raw.shape[0]
         data = raw.reshape(frames, 33, 4)[:, :, :3]
+        
+        # Root centering
         root = (data[:, 23, :] + data[:, 24, :]) / 2
         data = data - root.reshape(frames, 1, 3)
+        
+        # Shoulder scaling
         ls, rs = data[:, 11, :], data[:, 12, :]
         dist = np.sqrt(np.sum((ls - rs)**2, axis=1)).reshape(frames, 1, 1)
         dist = np.where(dist < 1e-4, 1.0, dist)
         data = (data / dist).reshape(frames, 99)
         
-        # Pad
-        if data.shape[0] > 100: data = data[(data.shape[0]-100)//2 : (data.shape[0]-100)//2+100]
-        elif data.shape[0] < 100: data = np.vstack((np.zeros((100-data.shape[0], 99)), data))
+        # Padding/Truncation to fixed length (100)
+        if data.shape[0] > 100: 
+            data = data[(data.shape[0]-100)//2 : (data.shape[0]-100)//2+100]
+        elif data.shape[0] < 100: 
+            data = np.vstack((np.zeros((100-data.shape[0], 99)), data))
         
         return torch.FloatTensor(data)
 
     def load_video(self, file_id):
-        # RGB处理逻辑 (rgb_model.py)
+        """
+        Loads video, uniformly samples 16 frames, and applies Kinetics-400 normalization.
+        """
         path = os.path.join(self.video_dir, file_id + ".avi")
         cap = cv2.VideoCapture(path)
         frames = []
@@ -102,10 +137,12 @@ class DualStreamDataset(Dataset):
         finally:
             cap.release()
             
-        if len(frames) == 0: return torch.zeros((3, 16, 128, 128))
+        if len(frames) == 0: 
+            return torch.zeros((3, 16, 128, 128))
         
         indices = np.linspace(0, len(frames)-1, 16).astype(int)
         buffer = torch.FloatTensor(np.array([frames[i] for i in indices])).permute(3, 0, 1, 2) / 255.0
+        
         mean = torch.tensor([0.432, 0.394, 0.376]).view(3, 1, 1, 1)
         std = torch.tensor([0.228, 0.221, 0.217]).view(3, 1, 1, 1)
         return (buffer - mean) / std
@@ -120,16 +157,16 @@ class DualStreamDataset(Dataset):
         
         return skel, rgb, label
 
-# =========================================================================
-# 🚀 主程序：验证融合效果
-# =========================================================================
+# ==========================================
+# Main Evaluation Routine
+# ==========================================
 if __name__ == "__main__":
-    print(f"📊 启动本地验证 (权重搜索版) | 设备: {device}")
+    print(f"Starting local validation | Device: {device}")
     
-    # 1. 准备验证集 (随机采样 20%)
     full_dataset = DualStreamDataset(CSV_FILE, TRAIN_VIDEO_DIR, TRAIN_SKELETON_DIR)
     dataset_len = len(full_dataset)
     indices = list(range(dataset_len))
+    
     np.random.seed(42) 
     np.random.shuffle(indices)
     split = int(0.8 * dataset_len)
@@ -141,8 +178,7 @@ if __name__ == "__main__":
     
     num_classes = len(full_dataset.unique_labels)
 
-    # 2. 加载模型
-    print("🧠 加载模型...")
+    print("Loading models...")
     skel_model = LightweightCNNLSTM(99, 128, num_classes).to(device)
     skel_model.load_state_dict(torch.load(SKELETON_MODEL_PATH, map_location=device))
     skel_model.eval()
@@ -153,8 +189,7 @@ if __name__ == "__main__":
     rgb_model.to(device)
     rgb_model.eval()
 
-    # 3. 收集所有验证样本的概率 (不进行 argmax)
-    print("🔥 正在收集预测概率...")
+    print("Collecting prediction probabilities...")
     all_skel_probs = []
     all_rgb_probs = []
     all_labels = []
@@ -163,7 +198,6 @@ if __name__ == "__main__":
         for i, (skel_in, rgb_in, labels) in enumerate(val_loader):
             skel_in, rgb_in, labels = skel_in.to(device), rgb_in.to(device), labels.to(device)
             
-            # 获取概率分布
             skel_probs = torch.softmax(skel_model(skel_in), dim=1)
             rgb_probs = torch.softmax(rgb_model(rgb_in), dim=1)
             
@@ -171,26 +205,22 @@ if __name__ == "__main__":
             all_rgb_probs.append(rgb_probs.cpu())
             all_labels.append(labels.cpu())
             
-            if (i+1) % 10 == 0: print(f"  Batch {i+1} done...")
+            if (i+1) % 10 == 0: 
+                print(f"  Processed batch {i+1}")
 
-    # 拼接
     final_skel_probs = torch.cat(all_skel_probs)
     final_rgb_probs = torch.cat(all_rgb_probs)
     final_labels = torch.cat(all_labels)
     
     print("-" * 60)
-    print("⚖️ 开始寻找最佳融合权重...")
+    print("Initiating grid search for optimal fusion weights...")
     
     best_acc = 0.0
     best_alpha = 0.0
     best_preds = None
     
-    # 4. 网格搜索 (从 0.0 到 1.0，步长 0.01)
-    # alpha 是 RGB 的权重，(1-alpha) 是骨架的权重
     for alpha in np.linspace(0, 1, 101):
-        # 融合公式
         fusion_probs = (alpha * final_rgb_probs) + ((1 - alpha) * final_skel_probs)
-        
         _, preds = torch.max(fusion_probs, 1)
         acc = (preds == final_labels).float().mean().item() * 100
         
@@ -200,13 +230,12 @@ if __name__ == "__main__":
             best_preds = preds
             
     print("-" * 60)
-    print(f"🏆 最佳融合结果:")
-    print(f"   最佳 RGB 权重 (Alpha): {best_alpha:.2f}")
-    print(f"   最佳 Skeleton 权重:    {1 - best_alpha:.2f}")
-    print(f"   🚀 最高准确率:         {best_acc:.2f}%")
+    print("Optimal Fusion Results:")
+    print(f"   RGB Weight (Alpha): {best_alpha:.2f}")
+    print(f"   Skeleton Weight:    {1 - best_alpha:.2f}")
+    print(f"   Max Accuracy:       {best_acc:.2f}%")
     print("-" * 60)
     
-    # 5. 用最佳结果画图
     cm = confusion_matrix(final_labels.numpy(), best_preds.numpy())
     plt.figure(figsize=(12, 10))
     sns.heatmap(cm, annot=False, cmap='Blues', 
@@ -216,4 +245,4 @@ if __name__ == "__main__":
     plt.xticks(rotation=90)
     plt.tight_layout()
     plt.savefig('fusion_analysis_optimized.png')
-    print("✅ 优化后的混淆矩阵已保存为 fusion_analysis_optimized.png")
+    print("Confusion matrix saved to fusion_analysis_optimized.png")
